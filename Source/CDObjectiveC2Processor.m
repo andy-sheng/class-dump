@@ -397,30 +397,77 @@
         //NSLog(@"method list data offset: %lu", [cursor offset]);
         
         struct cd_objc2_list_header listHeader;
-        
+
         // See getEntsize() from http://www.opensource.apple.com/source/objc4/objc4-532.2/runtime/objc-runtime-new.h
-        listHeader.entsize = [cursor readInt32] & ~(uint32_t)3;
+        // The top bit (0x80000000) of entsizeAndFlags marks a "small" / relative method list, where each
+        // entry is three signed 32-bit relative offsets (name, types, imp) instead of three pointers.  The
+        // 0x40000000 bit, when set, means the name offset points directly at the selector string; otherwise
+        // it points at a selector reference (a pointer to the string).  See objc-runtime-new.h method_t.
+        uint32_t entsizeAndFlags = [cursor readInt32];
         listHeader.count   = [cursor readInt32];
+
+        BOOL isSmall            = (entsizeAndFlags & 0x80000000) != 0;
+        BOOL directSelectors    = (entsizeAndFlags & 0x40000000) != 0;
+        listHeader.entsize      = entsizeAndFlags & 0x0000fffc;
+
+        if (isSmall) {
+            NSParameterAssert(listHeader.entsize == 3 * sizeof(uint32_t));
+
+            for (uint32_t index = 0; index < listHeader.count; index++) {
+                // Address of this entry's first field (name).  The list header is 8 bytes; each entry is 12.
+                uint64_t nameFieldAddress  = address + 8 + (uint64_t)index * 3 * sizeof(uint32_t);
+                uint64_t typesFieldAddress = nameFieldAddress + sizeof(uint32_t);
+                uint64_t impFieldAddress   = nameFieldAddress + 2 * sizeof(uint32_t);
+
+                int32_t nameOffset  = (int32_t)[cursor readInt32];
+                int32_t typesOffset = (int32_t)[cursor readInt32];
+                int32_t impOffset   = (int32_t)[cursor readInt32];
+
+                uint64_t nameAddress;
+                if (directSelectors) {
+                    nameAddress = nameFieldAddress + (int64_t)nameOffset;
+                } else {
+                    // The relative offset points to a selector reference; dereference it to get the string.
+                    uint64_t selectorRefAddress = nameFieldAddress + (int64_t)nameOffset;
+                    CDMachOFileDataCursor *selectorCursor = [[CDMachOFileDataCursor alloc] initWithFile:self.machOFile address:selectorRefAddress];
+                    nameAddress = [selectorCursor readPtr];
+                }
+                NSString *name  = [self.machOFile stringAtAddress:nameAddress];
+                NSString *types = [self.machOFile stringAtAddress:typesFieldAddress + (int64_t)typesOffset];
+                uint64_t imp    = impFieldAddress + (int64_t)impOffset;
+
+                if (extendedMethodTypesCursor) {
+                    uint64_t extendedMethodTypes = [extendedMethodTypesCursor readPtr];
+                    types = [self.machOFile stringAtAddress:extendedMethodTypes];
+                }
+
+                CDOCMethod *method = [[CDOCMethod alloc] initWithName:name typeString:types address:imp];
+                [methods addObject:method];
+            }
+
+            return [methods reversedArray];
+        }
+
         NSParameterAssert(listHeader.entsize == 3 * [self.machOFile ptrSize]);
-        
+
         for (uint32_t index = 0; index < listHeader.count; index++) {
             struct cd_objc2_method objc2Method;
-            
+
             objc2Method.name  = [cursor readPtr];
             objc2Method.types = [cursor readPtr];
             objc2Method.imp   = [cursor readPtr];
             NSString *name    = [self.machOFile stringAtAddress:objc2Method.name];
             NSString *types   = [self.machOFile stringAtAddress:objc2Method.types];
-            
+
             if (extendedMethodTypesCursor) {
                 uint64_t extendedMethodTypes = [extendedMethodTypesCursor readPtr];
                 types = [self.machOFile stringAtAddress:extendedMethodTypes];
             }
-            
+
             //NSLog(@"%3u: %016lx %016lx %016lx", index, objc2Method.name, objc2Method.types, objc2Method.imp);
             //NSLog(@"name: %@", name);
             //NSLog(@"types: %@", types);
-            
+
             CDOCMethod *method = [[CDOCMethod alloc] initWithName:name typeString:types address:objc2Method.imp];
             [methods addObject:method];
         }

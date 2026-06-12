@@ -97,6 +97,9 @@
 
         case LC_BUILD_VERSION:         targetClass = [CDLCBuildVersion class]; break;
 
+        case LC_DYLD_CHAINED_FIXUPS:   targetClass = [CDLCLinkeditData class]; break; // Handled by CDMachOFile.
+        case LC_DYLD_EXPORTS_TRIE:     targetClass = [CDLCLinkeditData class]; break;
+
         case LC_LINKER_OPTION:
         case LC_LINKER_OPTIMIZATION_HINT:
         case LC_VERSION_MIN_TVOS:

@@ -29,6 +29,10 @@ BOOL CDArchUses64BitLibraries(CDArch arch);
 @property (readonly) NSData *data;
 @property (readonly) CDSearchPathState *searchPathState;
 
+// Converts the backing data to an NSMutableData (in place) and returns it, so the bytes can be
+// patched.  Used to apply dyld chained fixups before processing.
+- (NSMutableData *)mutableData;
+
 - (BOOL)bestMatchForLocalArch:(CDArch *)oArchPtr;
 - (BOOL)bestMatchForArch:(CDArch *)ioArchPtr;
 - (CDMachOFile *)machOFileWithArch:(CDArch)arch;

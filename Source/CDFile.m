@@ -146,6 +146,14 @@ BOOL CDArchUses64BitLibraries(CDArch arch)
     return self;
 }
 
+- (NSMutableData *)mutableData;
+{
+    if (![_data isKindOfClass:[NSMutableData class]]) {
+        _data = [_data mutableCopy];
+    }
+    return (NSMutableData *)_data;
+}
+
 #pragma mark -
 
 // Return YES on success.  If oArchPtr is not NULL, return the best match.

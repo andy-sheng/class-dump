@@ -8,11 +8,13 @@
 #include <mach-o/arch.h>
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
+#include <mach-o/fixup-chains.h>
 
 #import "CDMachOFileDataCursor.h"
 #import "CDFatFile.h"
 #import "CDLoadCommand.h"
 #import "CDLCDyldInfo.h"
+#import "CDLCLinkeditData.h"
 #import "CDLCDylib.h"
 #import "CDLCDynamicSymbolTable.h"
 #import "CDLCEncryptionInfo.h"
@@ -61,6 +63,9 @@ static NSString *CDMachOFileMagicNumberDescription(uint32_t magic)
     NSArray *_runPathCommands;
     NSArray *_dyldEnvironment;
     NSArray *_reExportedDylibs;
+
+    CDLCLinkeditData *_chainedFixups;             // LC_DYLD_CHAINED_FIXUPS command, if present.
+    NSDictionary *_chainedFixupSymbolNames;       // address (NSNumber) -> imported symbol name (NSString).
 
     // The parts of struct mach_header_64 pulled out so that our property accessors can be synthesized.
 	uint32_t _magic;
@@ -153,6 +158,7 @@ static NSString *CDMachOFileMagicNumberDescription(uint32_t magic)
             if (loadCommand.cmd == LC_DYLD_ENVIRONMENT)                          [dyldEnvironment addObject:loadCommand];
             if (loadCommand.cmd == LC_REEXPORT_DYLIB)                            [reExportedDylibs addObject:loadCommand];
             if (loadCommand.cmd == LC_ID_DYLIB)                                  self.dylibIdentifier = (CDLCDylib *)loadCommand;
+            if (loadCommand.cmd == LC_DYLD_CHAINED_FIXUPS)                       _chainedFixups = (CDLCLinkeditData *)loadCommand;
 
             if ([loadCommand isKindOfClass:[CDLCSourceVersion class]])           self.sourceVersion = (CDLCSourceVersion *)loadCommand;
             else if ([loadCommand isKindOfClass:[CDLCBuildVersion class]])       self.buildVersion = (CDLCBuildVersion *)loadCommand;
@@ -179,6 +185,9 @@ static NSString *CDMachOFileMagicNumberDescription(uint32_t magic)
     for (CDLoadCommand *loadCommand in _loadCommands) {
         [loadCommand machOFileDidReadLoadCommands:self];
     }
+
+    if (_chainedFixups != nil)
+        [self _processChainedFixups];
 }
 
 #pragma mark - Debugging
@@ -542,12 +551,16 @@ static NSString *CDMachOFileMagicNumberDescription(uint32_t magic)
 
 - (BOOL)hasRelocationEntryForAddress2:(NSUInteger)address;
 {
+    if (_chainedFixupSymbolNames[@(address)] != nil)
+        return YES;
     return [self.dyldInfo symbolNameForAddress:address] != nil;
 }
 
 - (NSString *)externalClassNameForAddress2:(NSUInteger)address;
 {
-    NSString *str = [self.dyldInfo symbolNameForAddress:address];
+    NSString *str = _chainedFixupSymbolNames[@(address)];
+    if (str == nil)
+        str = [self.dyldInfo symbolNameForAddress:address];
 
     if (str != nil) {
         if ([str hasPrefix:ObjCClassSymbolPrefix]) {
@@ -559,6 +572,152 @@ static NSString *CDMachOFileMagicNumberDescription(uint32_t magic)
     }
 
     return nil;
+}
+
+#pragma mark - Dyld chained fixups
+
+// Modern Mach-O files (LC_DYLD_CHAINED_FIXUPS) no longer store rebase/bind information as a stream of
+// dyld_info opcodes.  Instead, the pointers in the data segments are themselves a linked list of "chains"
+// where each entry encodes either a rebase (an offset into this image) or a bind (an index into an imports
+// table of external symbols).  The rest of class-dump assumes the old behaviour, where on-disk pointers hold
+// real VM addresses, so here we walk the chains and rewrite each pointer in place: rebases become the real
+// VM address, binds become 0 (with the imported symbol name recorded for later superclass resolution).
+- (void)_processChainedFixups;
+{
+    NSData *blob = [_chainedFixups linkeditData];
+    if (blob.length < sizeof(struct dyld_chained_fixups_header))
+        return;
+
+    const uint8_t *cd = (const uint8_t *)blob.bytes;
+    const struct dyld_chained_fixups_header *header = (const struct dyld_chained_fixups_header *)cd;
+
+    // The image base is the VM address of the __TEXT segment (offset-based pointer formats are relative to it).
+    CDLCSegment *textSegment = [self segmentWithName:@"__TEXT"];
+    uint64_t imageBase = textSegment != nil ? (uint64_t)textSegment.vmaddr : 0;
+
+    // Build the table of imported symbol names, indexed by import ordinal.
+    NSMutableArray *importNames = [NSMutableArray array];
+    {
+        const char *symbolPool = (const char *)(cd + header->symbols_offset);
+        const void *imports = cd + header->imports_offset;
+        for (uint32_t index = 0; index < header->imports_count; index++) {
+            uint32_t nameOffset = 0;
+            switch (header->imports_format) {
+                case DYLD_CHAINED_IMPORT: {
+                    struct dyld_chained_import entry = ((const struct dyld_chained_import *)imports)[index];
+                    nameOffset = entry.name_offset;
+                    break;
+                }
+                case DYLD_CHAINED_IMPORT_ADDEND: {
+                    struct dyld_chained_import_addend entry = ((const struct dyld_chained_import_addend *)imports)[index];
+                    nameOffset = entry.name_offset;
+                    break;
+                }
+                case DYLD_CHAINED_IMPORT_ADDEND64: {
+                    struct dyld_chained_import_addend64 entry = ((const struct dyld_chained_import_addend64 *)imports)[index];
+                    nameOffset = (uint32_t)entry.name_offset;
+                    break;
+                }
+                default:
+                    break;
+            }
+            NSString *name = [NSString stringWithUTF8String:symbolPool + nameOffset] ?: @"";
+            [importNames addObject:name];
+        }
+    }
+
+    NSMutableData *mutableData = [self mutableData];
+    uint8_t *fileBytes = (uint8_t *)mutableData.mutableBytes;
+    NSMutableDictionary *symbolNames = [NSMutableDictionary dictionary];
+
+    const struct dyld_chained_starts_in_image *startsInImage = (const struct dyld_chained_starts_in_image *)(cd + header->starts_offset);
+    for (uint32_t segmentIndex = 0; segmentIndex < startsInImage->seg_count; segmentIndex++) {
+        uint32_t segInfoOffset = startsInImage->seg_info_offset[segmentIndex];
+        if (segInfoOffset == 0)
+            continue;
+
+        const struct dyld_chained_starts_in_segment *segInfo = (const struct dyld_chained_starts_in_segment *)((const uint8_t *)startsInImage + segInfoOffset);
+        uint16_t pointerFormat = segInfo->pointer_format;
+        BOOL isArm64e = (pointerFormat == DYLD_CHAINED_PTR_ARM64E ||
+                         pointerFormat == DYLD_CHAINED_PTR_ARM64E_KERNEL ||
+                         pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND ||
+                         pointerFormat == DYLD_CHAINED_PTR_ARM64E_FIRMWARE ||
+                         pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND24);
+        // The "next" field of each pointer is a count of strides to the following pointer in the chain.
+        uint32_t stride = (pointerFormat == DYLD_CHAINED_PTR_ARM64E ||
+                           pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND ||
+                           pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND24) ? 8 : 4;
+
+        if (pointerFormat != DYLD_CHAINED_PTR_64 &&
+            pointerFormat != DYLD_CHAINED_PTR_64_OFFSET &&
+            !isArm64e) {
+            NSLog(@"Warning: Unsupported dyld chained pointer format %u; skipping segment.", pointerFormat);
+            continue;
+        }
+
+        for (uint16_t pageIndex = 0; pageIndex < segInfo->page_count; pageIndex++) {
+            uint16_t startOffset = segInfo->page_start[pageIndex];
+            if (startOffset == DYLD_CHAINED_PTR_START_NONE)
+                continue;
+            if (startOffset & DYLD_CHAINED_PTR_START_MULTI) {
+                NSLog(@"Warning: dyld chained fixups with multiple starts per page are not supported.");
+                continue;
+            }
+
+            uint64_t chainAddress = imageBase + segInfo->segment_offset + (uint64_t)pageIndex * segInfo->page_size + startOffset;
+            BOOL done = NO;
+            while (!done) {
+                NSUInteger fileOffset = [self dataOffsetForAddress:chainAddress];
+                uint64_t raw = *(const uint64_t *)(fileBytes + fileOffset);
+
+                uint64_t next;
+                BOOL isBind;
+                uint64_t newValue = 0;
+                BOOL writeValue = YES;
+
+                if (isArm64e) {
+                    isBind = (raw >> 62) & 0x1;
+                    BOOL isAuth = (raw >> 63) & 0x1;
+                    next = (raw >> 51) & 0x7ff;
+                    if (isBind) {
+                        uint64_t ordinal = (pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND24) ? (raw & 0xffffff) : (raw & 0xffff);
+                        if (ordinal < importNames.count)
+                            symbolNames[@(chainAddress)] = importNames[(NSUInteger)ordinal];
+                        newValue = 0;
+                    } else if (isAuth) {
+                        uint64_t target = raw & 0xffffffff;
+                        newValue = imageBase + target;
+                    } else {
+                        uint64_t target = raw & 0x7ffffffffff; // 43 bits
+                        newValue = (pointerFormat == DYLD_CHAINED_PTR_ARM64E) ? target : imageBase + target;
+                    }
+                } else {
+                    // DYLD_CHAINED_PTR_64 or DYLD_CHAINED_PTR_64_OFFSET
+                    isBind = (raw >> 63) & 0x1;
+                    next = (raw >> 51) & 0xfff;
+                    if (isBind) {
+                        uint64_t ordinal = raw & 0xffffff; // 24 bits
+                        if (ordinal < importNames.count)
+                            symbolNames[@(chainAddress)] = importNames[(NSUInteger)ordinal];
+                        newValue = 0;
+                    } else {
+                        uint64_t target = raw & 0xfffffffff; // 36 bits
+                        newValue = (pointerFormat == DYLD_CHAINED_PTR_64) ? target : imageBase + target;
+                    }
+                }
+
+                if (writeValue)
+                    *(uint64_t *)(fileBytes + fileOffset) = newValue;
+
+                if (next == 0)
+                    done = YES;
+                else
+                    chainAddress += next * stride;
+            }
+        }
+    }
+
+    _chainedFixupSymbolNames = [symbolNames copy];
 }
 
 - (BOOL)hasObjectiveC1Data;
