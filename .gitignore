@@ -1,0 +1,14 @@
+# Build products
+/build/
+DerivedData/
+*.dSYM/
+
+# Local test inputs (large .app/.ipa bundles)
+/ipas/
+
+# macOS
+.DS_Store
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
