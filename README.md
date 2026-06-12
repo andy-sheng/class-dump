@@ -14,6 +14,29 @@ The source code is also available from my Github repository at:
 
     https://github.com/nygard/class-dump
 
+This fork
+---------
+
+This fork modernizes class-dump so it works with current iOS/macOS
+binaries.  It adds support for dyld chained fixups (LC_DYLD_CHAINED_FIXUPS)
+and relative ("small") Objective-C method lists, and fixes the build
+against recent SDKs.
+
+Installation
+------------
+
+Via Homebrew:
+
+    brew tap andy-sheng/class-dump https://github.com/andy-sheng/class-dump
+    brew install andy-sheng/class-dump/class-dump
+
+Or download a prebuilt universal binary from the
+[Releases](https://github.com/andy-sheng/class-dump/releases) page.
+
+To build from source:
+
+    ./scripts/build-release.sh    # universal arm64 + x86_64 binary in build/release/
+
 Usage
 -----
 
