@@ -1,0 +1,16 @@
+[package]
+name = "class-dump"
+version = "3.5.1"
+edition = "2021"
+description = "Generate Objective-C headers from Mach-O files (Rust port)"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "class-dump"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
