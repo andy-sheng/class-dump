@@ -33,6 +33,17 @@ pub trait TypeNamer {
     fn should_expand_type(&self, ty: &CDType) -> bool;
 }
 
+/// A namer with no type controller (used for block signatures): no typedefs, no expansion.
+pub struct NullNamer;
+impl TypeNamer for NullNamer {
+    fn typedef_name_for_structure(&self, _ty: &CDType, _cfg: &FormatterCfg, _level: usize) -> Option<String> {
+        None
+    }
+    fn should_expand_type(&self, _ty: &CDType) -> bool {
+        false
+    }
+}
+
 impl CDType {
     fn simple(prim: u8) -> CDType {
         CDType { prim, ..Default::default() }
@@ -184,7 +195,21 @@ impl CDType {
         }
         if count == other_count {
             for i in 0..count {
-                if !self.members[i].can_merge_with(&other.members[i]) {
+                let a = &self.members[i];
+                let b = &other.members[i];
+                // Conflicting struct/union tag names block the merge.
+                if let (Some(an), Some(bn)) = (&a.type_name, &b.type_name) {
+                    if an != bn {
+                        return false;
+                    }
+                }
+                // Conflicting member variable names block the merge.
+                if let (Some(an), Some(bn)) = (&a.variable_name, &b.variable_name) {
+                    if an != bn {
+                        return false;
+                    }
+                }
+                if !a.can_merge_with(b) {
                     return false;
                 }
             }
@@ -419,13 +444,16 @@ impl CDType {
         s
     }
 
-    fn block_signature_string(&self, namer: &dyn TypeNamer) -> String {
+    fn block_signature_string(&self, _namer: &dyn TypeNamer) -> String {
+        // The block-signature formatter has no type controller, so struct/union tags are
+        // emitted bare (no CDStruct_ typedef names, no expansion).
         let cfg = FormatterCfg {
             should_expand: false,
             should_auto_expand: false,
             base_level: 0,
             is_struct_decl: false,
         };
+        let namer = &NullNamer;
         let types = self.block_types.as_ref().unwrap();
         let mut s = String::new();
         let n = types.len();
@@ -465,6 +493,18 @@ impl CDType {
             }
         }
     }
+}
+
+fn is_simple_type(c: u8) -> bool {
+    matches!(
+        c,
+        b'c' | b'i' | b's' | b'l' | b'q' | b'C' | b'I' | b'S' | b'L' | b'Q'
+        | b'f' | b'd' | b'D' | b'B' | b'v' | b'*' | b'#' | b':' | b'%' | b'?'
+    )
+}
+
+fn missing_type() -> CDType {
+    CDType { prim: T_NAMED_OBJECT, type_name: Some("MISSING_TYPE".to_string()), ..Default::default() }
 }
 
 fn is_identifier_start(c: u8) -> bool {
@@ -576,7 +616,7 @@ impl<'a> Parser<'a> {
     fn parse_type_in_struct(&mut self, in_struct: bool) -> CDType {
         let c = match self.peek() {
             Some(c) => c,
-            None => return CDType::simple(b'?'),
+            None => return missing_type(),
         };
         match c {
             b'j' | b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' | b'A' => {
@@ -682,9 +722,14 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 CDType { prim: b'^', subtype: Some(Box::new(CDType::simple(b'c'))), ..Default::default() }
             }
-            _ => {
+            _ if is_simple_type(c) => {
                 self.pos += 1;
                 CDType::simple(c)
+            }
+            _ => {
+                // Unrecognized token: class-dump produces a named object "MISSING_TYPE".
+                self.pos += 1;
+                missing_type()
             }
         }
     }
