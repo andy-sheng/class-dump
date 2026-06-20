@@ -2,7 +2,9 @@ mod cursor;
 mod macho;
 mod objc;
 mod output;
+mod sha1;
 mod typ;
+mod typecontroller;
 
 use macho::MachOFile;
 use std::process::exit;
@@ -33,7 +35,7 @@ fn main() {
     let mut processor = objc::Processor::new(&file);
     let image = processor.process();
 
-    let opts = output::Options { sort_by_name: true, sort_methods: false };
+    let opts = output::Options { sort_methods: false };
     let text = output::dump(&file, &image, &opts);
     print!("{}", text);
 }

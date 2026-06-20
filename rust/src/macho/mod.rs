@@ -421,6 +421,28 @@ impl MachOFile {
         self.segment_with_name("__OBJC").is_some()
     }
 
+    /// The second word of __objc_imageinfo (flags), used for the GC status line.
+    pub fn objc_image_info_flags(&self) -> Option<u32> {
+        let sect = self
+            .segments
+            .iter()
+            .flat_map(|s| s.sections.iter())
+            .find(|s| s.sectname == "__objc_imageinfo")?;
+        if sect.size < 8 {
+            return None;
+        }
+        let off = sect.offset as usize;
+        if off + 8 > self.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            self.data[off + 4],
+            self.data[off + 5],
+            self.data[off + 6],
+            self.data[off + 7],
+        ]))
+    }
+
     /// External class name for an address where a superclass pointer was bound (CDMachOFile).
     pub fn external_class_name_for_address(&self, addr: u64) -> Option<String> {
         let name = self.symbol_names_by_address.get(&addr)?;

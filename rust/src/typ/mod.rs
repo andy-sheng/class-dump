@@ -1,27 +1,515 @@
-//! Objective-C @encode type parsing and formatting, mirroring the CDType* family.
-//!
-//! This is a first cut that handles primitives, objects, pointers, arrays, bitfields,
-//! structs and unions, plus method-signature formatting.  Struct expansion into a
-//! "Named Structures" section is handled separately by the output stage.
+//! Faithful port of CDType / CDTypeParser / CDTypeLexer: the Objective-C @encode
+//! type AST, its canonical string forms, structure depth, merging, member-name
+//! generation, and formatting.
 
-#[derive(Clone, Debug)]
-pub enum Type {
-    Primitive(char),
-    Id,
-    NamedObject(String),
-    Block,
-    Class,
-    Sel,
-    CharStar,
-    Pointer(Box<Type>),
-    Array(u64, Box<Type>),
-    Struct(String, Vec<(Option<String>, Type)>),
-    Union(String, Vec<(Option<String>, Type)>),
-    Bitfield(u32),
-    FunctionPointer,
-    Unknown,
-    Modifier(char, Box<Type>),
+pub const T_NAMED_OBJECT: u8 = 1;
+pub const T_FUNCTION_POINTER: u8 = 2;
+pub const T_BLOCK: u8 = 3;
+
+#[derive(Clone, Default)]
+pub struct CDType {
+    pub prim: u8,
+    pub subtype: Option<Box<CDType>>,
+    pub members: Vec<CDType>,
+    pub type_name: Option<String>,
+    pub variable_name: Option<String>,
+    pub bitfield_size: String,
+    pub array_size: String,
+    pub protocols: Vec<String>,
+    pub block_types: Option<Vec<CDType>>,
 }
+
+/// Formatter configuration, mirroring CDTypeFormatter's flags.
+pub struct FormatterCfg {
+    pub should_expand: bool,
+    pub should_auto_expand: bool,
+    pub base_level: usize,
+    pub is_struct_decl: bool,
+}
+
+/// Implemented by the type controller; supplies typedef names and expand decisions.
+pub trait TypeNamer {
+    fn typedef_name_for_structure(&self, ty: &CDType, cfg: &FormatterCfg, level: usize) -> Option<String>;
+    fn should_expand_type(&self, ty: &CDType) -> bool;
+}
+
+impl CDType {
+    fn simple(prim: u8) -> CDType {
+        CDType { prim, ..Default::default() }
+    }
+
+    pub fn is_id_type(&self) -> bool {
+        self.prim == b'@'
+    }
+    pub fn is_named_object(&self) -> bool {
+        self.prim == T_NAMED_OBJECT
+    }
+    pub fn is_struct(&self) -> bool {
+        self.prim == b'{'
+    }
+    pub fn is_union(&self) -> bool {
+        self.prim == b'('
+    }
+
+    /// The struct/union tag description used as a dictionary key: "?" for anonymous.
+    pub fn type_name_description(&self) -> String {
+        self.type_name.clone().unwrap_or_default()
+    }
+
+    pub fn is_template_type(&self) -> bool {
+        self.type_name.as_deref().map(|n| n.contains('<')).unwrap_or(false)
+    }
+
+    // ----- canonical type strings -----
+
+    pub fn type_string(&self) -> String {
+        self._type_string(1_000_000, true)
+    }
+    pub fn bare_type_string(&self) -> String {
+        self._type_string(0, true)
+    }
+    pub fn really_bare_type_string(&self) -> String {
+        self._type_string(0, false)
+    }
+
+    fn _type_string(&self, level: i64, show_objects: bool) -> String {
+        match self.prim {
+            T_NAMED_OBJECT => {
+                if show_objects {
+                    format!("@\"{}\"", self.type_name.clone().unwrap_or_default())
+                } else {
+                    "@".to_string()
+                }
+            }
+            b'@' => "@".to_string(),
+            b'b' => format!("b{}", self.bitfield_size),
+            b'[' => format!(
+                "[{}{}]",
+                self.array_size,
+                self.subtype_string(level, show_objects)
+            ),
+            b'(' => self.record_string('(', ')', level, show_objects),
+            b'{' => self.record_string('{', '}', level, show_objects),
+            b'^' => format!("^{}", self.subtype_string(level, show_objects)),
+            b'j' | b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' | b'A' => {
+                format!("{}{}", self.prim as char, self.subtype_string(level, show_objects))
+            }
+            T_FUNCTION_POINTER => "^?".to_string(),
+            T_BLOCK => "@?".to_string(),
+            _ => format!("{}", self.prim as char),
+        }
+    }
+
+    fn subtype_string(&self, level: i64, show_objects: bool) -> String {
+        match &self.subtype {
+            Some(s) => s._type_string(level, show_objects),
+            None => String::new(),
+        }
+    }
+
+    fn record_string(&self, open: char, close: char, level: i64, show_objects: bool) -> String {
+        match &self.type_name {
+            None => format!("{}{}{}", open, self.members_string(level, show_objects), close),
+            Some(name) if self.members.is_empty() => format!("{}{}{}", open, name, close),
+            Some(name) => format!(
+                "{}{}={}{}",
+                open,
+                name,
+                self.members_string(level, show_objects),
+                close
+            ),
+        }
+    }
+
+    fn members_string(&self, level: i64, show_objects: bool) -> String {
+        let mut s = String::new();
+        for m in &self.members {
+            if level > 0 {
+                if let Some(vn) = &m.variable_name {
+                    s.push_str(&format!("\"{}\"", vn));
+                }
+            }
+            s.push_str(&m._type_string(level - 1, show_objects));
+        }
+        s
+    }
+
+    // ----- structure depth -----
+
+    pub fn structure_depth(&self) -> usize {
+        if let Some(s) = &self.subtype {
+            return s.structure_depth();
+        }
+        if self.prim == b'{' || self.prim == b'(' {
+            let mut max = 0;
+            for m in &self.members {
+                let d = m.structure_depth();
+                if d > max {
+                    max = d;
+                }
+            }
+            return max + 1;
+        }
+        0
+    }
+
+    // ----- merging -----
+
+    pub fn can_merge_with(&self, other: &CDType) -> bool {
+        if self.is_id_type() && other.is_named_object() {
+            return true;
+        }
+        if self.is_named_object() && other.is_id_type() {
+            return true;
+        }
+        if self.prim != other.prim {
+            return false;
+        }
+        match (&self.subtype, &other.subtype) {
+            (Some(a), Some(b)) => {
+                if !a.can_merge_with(b) {
+                    return false;
+                }
+            }
+            (None, Some(_)) => return false,
+            _ => {}
+        }
+        let count = self.members.len();
+        let other_count = other.members.len();
+        if count != 0 && other_count == 0 {
+            return false;
+        }
+        if count != 0 && count != other_count {
+            return false;
+        }
+        if count == other_count {
+            for i in 0..count {
+                if !self.members[i].can_merge_with(&other.members[i]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn merge_with(&mut self, other: &CDType) {
+        self.recursively_merge_with(other);
+    }
+
+    fn recursively_merge_with(&mut self, other: &CDType) {
+        if self.is_id_type() && other.is_named_object() {
+            self.prim = T_NAMED_OBJECT;
+            self.type_name = other.type_name.clone();
+            return;
+        }
+        if self.is_named_object() && other.is_id_type() {
+            return;
+        }
+        if self.prim != other.prim {
+            return;
+        }
+        if let (Some(a), Some(b)) = (self.subtype.as_mut(), other.subtype.as_ref()) {
+            a.recursively_merge_with(b);
+        }
+        let count = self.members.len();
+        let other_count = other.members.len();
+        if other_count == 0 {
+            return;
+        } else if count == 0 && other_count != 0 {
+            self.members = other.members.clone();
+            return;
+        } else if count != other_count {
+            return;
+        }
+        for i in 0..count {
+            if let Some(ovn) = &other.members[i].variable_name {
+                if self.members[i].variable_name.is_none() {
+                    self.members[i].variable_name = Some(ovn.clone());
+                }
+            }
+            let om = other.members[i].clone();
+            self.members[i].recursively_merge_with(&om);
+        }
+    }
+
+    // ----- member name generation -----
+
+    pub fn generate_member_names(&mut self) {
+        if self.prim == b'{' || self.prim == b'(' {
+            let used: std::collections::HashSet<String> = self
+                .members
+                .iter()
+                .filter_map(|m| m.variable_name.clone())
+                .collect();
+            let mut number = 1usize;
+            for m in &mut self.members {
+                m.generate_member_names();
+                if m.variable_name.is_none() && m.prim != b'b' {
+                    let mut name;
+                    loop {
+                        name = format!("_field{}", number);
+                        number += 1;
+                        if !used.contains(&name) {
+                            break;
+                        }
+                    }
+                    m.variable_name = Some(name);
+                }
+            }
+        }
+        if let Some(s) = self.subtype.as_mut() {
+            s.generate_member_names();
+        }
+    }
+
+    // ----- formatting -----
+
+    pub fn formatted_string(
+        &self,
+        previous_name: Option<&str>,
+        namer: &dyn TypeNamer,
+        cfg: &FormatterCfg,
+        level: usize,
+    ) -> String {
+        let current_name: Option<String> = if self.variable_name.is_some() {
+            self.variable_name.clone()
+        } else {
+            previous_name.map(|s| s.to_string())
+        };
+        let cn = current_name.as_deref();
+
+        match self.prim {
+            T_NAMED_OBJECT => {
+                let type_name = if self.protocols.is_empty() {
+                    self.type_name.clone().unwrap_or_default()
+                } else {
+                    format!(
+                        "{}<{}>",
+                        self.type_name.clone().unwrap_or_default(),
+                        self.protocols.join(", ")
+                    )
+                };
+                match cn {
+                    None => format!("{} *", type_name),
+                    Some(n) => format!("{} *{}", type_name, n),
+                }
+            }
+            b'@' => match cn {
+                None => {
+                    if self.protocols.is_empty() {
+                        "id".to_string()
+                    } else {
+                        format!("id <{}>", self.protocols.join(", "))
+                    }
+                }
+                Some(n) => {
+                    if self.protocols.is_empty() {
+                        format!("id {}", n)
+                    } else {
+                        format!("id <{}> {}", self.protocols.join(", "), n)
+                    }
+                }
+            },
+            b'b' => match cn {
+                None => format!("unsigned int :{}", self.bitfield_size),
+                Some(n) => format!("unsigned int {}:{}", n, self.bitfield_size),
+            },
+            b'[' => {
+                let result = match cn {
+                    None => format!("[{}]", self.array_size),
+                    Some(n) => format!("{}[{}]", n, self.array_size),
+                };
+                match &self.subtype {
+                    Some(s) => s.formatted_string(Some(&result), namer, cfg, level),
+                    None => result,
+                }
+            }
+            b'(' => self.format_record('(', "union", cn, namer, cfg, level),
+            b'{' => self.format_record('{', "struct", cn, namer, cfg, level),
+            b'^' => {
+                let mut result = match cn {
+                    None => "*".to_string(),
+                    Some(n) => format!("*{}", n),
+                };
+                if let Some(s) = &self.subtype {
+                    if s.prim == b'[' {
+                        result = format!("({})", result);
+                    }
+                    return s.formatted_string(Some(&result), namer, cfg, level);
+                }
+                result
+            }
+            T_FUNCTION_POINTER => match cn {
+                None => "CDUnknownFunctionPointerType".to_string(),
+                Some(n) => format!("CDUnknownFunctionPointerType {}", n),
+            },
+            T_BLOCK => {
+                if self.block_types.is_some() {
+                    self.block_signature_string(namer)
+                } else {
+                    match cn {
+                        None => "CDUnknownBlockType".to_string(),
+                        Some(n) => format!("CDUnknownBlockType {}", n),
+                    }
+                }
+            }
+            b'j' | b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' | b'A' => match &self.subtype {
+                None => match cn {
+                    None => simple_type_name(self.prim).to_string(),
+                    Some(n) => format!("{} {}", simple_type_name(self.prim), n),
+                },
+                Some(s) => format!(
+                    "{} {}",
+                    simple_type_name(self.prim),
+                    s.formatted_string(cn, namer, cfg, level)
+                ),
+            },
+            _ => match cn {
+                None => simple_type_name(self.prim).to_string(),
+                Some(n) => format!("{} {}", simple_type_name(self.prim), n),
+            },
+        }
+    }
+
+    fn format_record(
+        &self,
+        open: char,
+        keyword: &str,
+        current_name: Option<&str>,
+        namer: &dyn TypeNamer,
+        cfg: &FormatterCfg,
+        level: usize,
+    ) -> String {
+        let mut base_type: Option<String> = namer.typedef_name_for_structure(self, cfg, level);
+
+        if base_type.is_none() {
+            let name_desc = self.type_name_description();
+            let mut bt = if self.type_name.is_none() || name_desc == "?" {
+                keyword.to_string()
+            } else {
+                format!("{} {}", keyword, name_desc)
+            };
+            let expand = (cfg.should_auto_expand
+                && namer.should_expand_type(self)
+                && !self.members.is_empty())
+                || (level == 0 && cfg.should_expand && !self.members.is_empty());
+            if expand {
+                let inner = self.formatted_members(namer, cfg, level + 1);
+                let indent = " ".repeat((cfg.base_level + level) * 4);
+                bt.push_str(&format!(" {{\n{}{}}}", inner, indent));
+            }
+            base_type = Some(bt);
+        }
+        let base_type = base_type.unwrap();
+        let _ = open;
+        match current_name {
+            None => base_type,
+            Some(n) => format!("{} {}", base_type, n),
+        }
+    }
+
+    fn formatted_members(&self, namer: &dyn TypeNamer, cfg: &FormatterCfg, level: usize) -> String {
+        let mut s = String::new();
+        let indent = " ".repeat((cfg.base_level + level) * 4);
+        for m in &self.members {
+            s.push_str(&indent);
+            s.push_str(&m.formatted_string(None, namer, cfg, level));
+            s.push_str(";\n");
+        }
+        s
+    }
+
+    fn block_signature_string(&self, namer: &dyn TypeNamer) -> String {
+        let cfg = FormatterCfg {
+            should_expand: false,
+            should_auto_expand: false,
+            base_level: 0,
+            is_struct_decl: false,
+        };
+        let types = self.block_types.as_ref().unwrap();
+        let mut s = String::new();
+        let n = types.len();
+        for (idx, t) in types.iter().enumerate() {
+            if idx != 1 {
+                s.push_str(&t.formatted_string(None, namer, &cfg, 0));
+            } else {
+                s.push_str("(^)");
+            }
+            let is_last = idx == n - 1;
+            if idx == 0 {
+                s.push(' ');
+            } else if idx == 1 {
+                s.push('(');
+            } else if idx >= 2 && !is_last {
+                s.push_str(", ");
+            }
+            if is_last {
+                if n == 2 {
+                    s.push_str("void");
+                }
+                s.push(')');
+            }
+        }
+        s
+    }
+
+    /// Walk all struct/union subtypes (used by phase registration in the controller).
+    pub fn walk_structs<F: FnMut(&CDType)>(&self, f: &mut F) {
+        if let Some(s) = &self.subtype {
+            s.walk_structs(f);
+        }
+        if (self.prim == b'{' || self.prim == b'(') && !self.members.is_empty() {
+            f(self);
+            for m in &self.members {
+                m.walk_structs(f);
+            }
+        }
+    }
+}
+
+fn is_identifier_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, b'$' | b'_' | b':' | b'*')
+}
+fn is_identifier_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'$' | b'_' | b':' | b'*')
+}
+
+fn simple_type_name(prim: u8) -> &'static str {
+    match prim {
+        b'c' => "char",
+        b'i' => "int",
+        b's' => "short",
+        b'l' => "long",
+        b'q' => "long long",
+        b'C' => "unsigned char",
+        b'I' => "unsigned int",
+        b'S' => "unsigned short",
+        b'L' => "unsigned long",
+        b'Q' => "unsigned long long",
+        b'f' => "float",
+        b'd' => "double",
+        b'D' => "long double",
+        b'B' => "_Bool",
+        b'v' => "void",
+        b'*' => "STR",
+        b'#' => "Class",
+        b':' => "SEL",
+        b'%' => "NXAtom",
+        b'?' => "void",
+        b'j' => "_Complex",
+        b'r' => "const",
+        b'n' => "in",
+        b'N' => "inout",
+        b'o' => "out",
+        b'O' => "bycopy",
+        b'R' => "byref",
+        b'V' => "oneway",
+        b'A' => "_Atomic",
+        _ => "UNKNOWN",
+    }
+}
+
+// ===== Parser (port of CDTypeParser / CDTypeLexer) =====
 
 pub struct Parser<'a> {
     bytes: &'a [u8],
@@ -37,25 +525,11 @@ impl<'a> Parser<'a> {
         self.bytes.get(self.pos).copied()
     }
 
-    fn next(&mut self) -> Option<u8> {
-        let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
+    fn at_end(&self) -> bool {
+        self.pos >= self.bytes.len()
     }
 
-    fn skip_digits(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn read_number(&mut self) -> u64 {
+    fn read_number(&mut self) -> String {
         let start = self.pos;
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
@@ -64,311 +538,318 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        std::str::from_utf8(&self.bytes[start..self.pos])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+        String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned()
     }
 
-    /// Parse a single type.
-    pub fn parse_type(&mut self) -> Type {
+    fn read_quoted(&mut self) -> String {
+        // assumes current char is '"'
+        self.pos += 1;
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == b'"' {
+                break;
+            }
+            self.pos += 1;
+        }
+        let s = String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned();
+        if self.peek() == Some(b'"') {
+            self.pos += 1;
+        }
+        s
+    }
+
+    /// Parse a single type. Public for property types.
+    pub fn parse_type(&mut self) -> CDType {
+        self.parse_type_in_struct(false)
+    }
+
+    fn is_type_start(&self, c: u8) -> bool {
+        matches!(
+            c,
+            b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' | b'A' | b'j'
+            | b'^' | b'b' | b'@' | b'{' | b'(' | b'['
+            | b'c' | b'i' | b's' | b'l' | b'q' | b'C' | b'I' | b'S' | b'L' | b'Q'
+            | b'f' | b'd' | b'D' | b'B' | b'v' | b'*' | b'#' | b':' | b'%' | b'?'
+        )
+    }
+
+    fn parse_type_in_struct(&mut self, in_struct: bool) -> CDType {
         let c = match self.peek() {
             Some(c) => c,
-            None => return Type::Unknown,
+            None => return CDType::simple(b'?'),
         };
         match c {
-            b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' | b'A' | b'j' => {
+            b'j' | b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' | b'A' => {
                 self.pos += 1;
-                let inner = self.parse_type();
-                Type::Modifier(c as char, Box::new(inner))
-            }
-            b'@' => {
-                self.pos += 1;
-                match self.peek() {
-                    Some(b'"') => {
-                        self.pos += 1;
-                        let start = self.pos;
-                        while let Some(ch) = self.peek() {
-                            if ch == b'"' {
-                                break;
-                            }
-                            self.pos += 1;
-                        }
-                        let name =
-                            String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned();
-                        if self.peek() == Some(b'"') {
-                            self.pos += 1;
-                        }
-                        // @"<NSCopying>" style protocol-only is still an object; keep name.
-                        Type::NamedObject(name)
-                    }
-                    Some(b'?') => {
-                        self.pos += 1;
-                        Type::Block
-                    }
-                    _ => Type::Id,
-                }
-            }
-            b'#' => {
-                self.pos += 1;
-                Type::Class
-            }
-            b':' => {
-                self.pos += 1;
-                Type::Sel
-            }
-            b'*' => {
-                self.pos += 1;
-                Type::CharStar
+                let sub = if self.peek().map(|x| self.is_type_start(x)).unwrap_or(false) {
+                    Some(Box::new(self.parse_type_in_struct(in_struct)))
+                } else {
+                    None
+                };
+                CDType { prim: c, subtype: sub, ..Default::default() }
             }
             b'^' => {
                 self.pos += 1;
-                if self.peek() == Some(b'?') {
+                match self.peek() {
+                    Some(b'"') | Some(b'}') | Some(b')') | None => {
+                        CDType { prim: b'^', subtype: Some(Box::new(CDType::simple(b'v'))), ..Default::default() }
+                    }
+                    Some(b'?') => {
+                        self.pos += 1;
+                        CDType { prim: T_FUNCTION_POINTER, ..Default::default() }
+                    }
+                    _ => {
+                        let sub = self.parse_type_in_struct(in_struct);
+                        CDType { prim: b'^', subtype: Some(Box::new(sub)), ..Default::default() }
+                    }
+                }
+            }
+            b'b' => {
+                self.pos += 1;
+                let n = self.read_number();
+                CDType { prim: b'b', bitfield_size: n, ..Default::default() }
+            }
+            b'@' => {
+                self.pos += 1;
+                if self.peek() == Some(b'"')
+                    && (!in_struct || self.quoted_is_object_name())
+                {
+                    let s = self.read_quoted();
+                    self.parse_object_name(s)
+                } else if self.peek() == Some(b'?') {
                     self.pos += 1;
-                    Type::FunctionPointer
+                    let mut block_types = None;
+                    if self.peek() == Some(b'<') {
+                        self.pos += 1;
+                        block_types = Some(self.parse_method_type_list(b'>'));
+                        if self.peek() == Some(b'>') {
+                            self.pos += 1;
+                        }
+                    }
+                    CDType { prim: T_BLOCK, block_types, ..Default::default() }
                 } else {
-                    Type::Pointer(Box::new(self.parse_type()))
+                    CDType::simple(b'@')
+                }
+            }
+            b'{' => {
+                self.pos += 1;
+                let name = self.parse_type_name(false);
+                let members = self.parse_optional_members(b'}');
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                }
+                CDType { prim: b'{', type_name: name, members, ..Default::default() }
+            }
+            b'(' => {
+                self.pos += 1;
+                // union: either a name (identifier) then optional '=' members, or a bare list of types.
+                let starts_name = self
+                    .peek()
+                    .map(|c| is_identifier_start(c) || c == b'?')
+                    .unwrap_or(false);
+                if starts_name {
+                    let name = self.parse_type_name(false);
+                    let members = self.parse_optional_members(b')');
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                    }
+                    CDType { prim: b'(', type_name: name, members, ..Default::default() }
+                } else {
+                    let mut members = Vec::new();
+                    while let Some(c) = self.peek() {
+                        if c == b')' {
+                            break;
+                        }
+                        members.push(self.parse_type_in_struct(true));
+                    }
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                    }
+                    CDType { prim: b'(', type_name: None, members, ..Default::default() }
                 }
             }
             b'[' => {
                 self.pos += 1;
-                let count = self.read_number();
-                let inner = self.parse_type();
+                let n = self.read_number();
+                let sub = self.parse_type();
                 if self.peek() == Some(b']') {
                     self.pos += 1;
                 }
-                Type::Array(count, Box::new(inner))
+                CDType { prim: b'[', array_size: n, subtype: Some(Box::new(sub)), ..Default::default() }
             }
-            b'{' => self.parse_struct_or_union(b'{', b'}'),
-            b'(' => self.parse_struct_or_union(b'(', b')'),
-            b'b' => {
+            b'*' => {
+                // class-dump represents char* (`*`) as ^c (pointer to char).
                 self.pos += 1;
-                let n = self.read_number();
-                Type::Bitfield(n as u32)
-            }
-            b'?' => {
-                self.pos += 1;
-                Type::Unknown
+                CDType { prim: b'^', subtype: Some(Box::new(CDType::simple(b'c'))), ..Default::default() }
             }
             _ => {
-                // primitive
                 self.pos += 1;
-                Type::Primitive(c as char)
+                CDType::simple(c)
             }
         }
     }
 
-    fn parse_struct_or_union(&mut self, open: u8, close: u8) -> Type {
-        self.pos += 1; // consume open
-        // read name up to '=' or close
+    /// Heuristic for `@` inside a struct: a quoted string is an object name (vs a member name)
+    /// if the next type token doesn't immediately follow as a member.
+    fn quoted_is_object_name(&self) -> bool {
+        // Peek the quoted content's first letter and the char after the closing quote.
+        // Mirrors: isFirstLetterUppercase OR the following token is not a type start.
+        let mut i = self.pos + 1;
+        let first = self.bytes.get(i).copied().unwrap_or(0);
+        while i < self.bytes.len() && self.bytes[i] != b'"' {
+            i += 1;
+        }
+        let after = self.bytes.get(i + 1).copied().unwrap_or(0);
+        first.is_ascii_uppercase() || !self.is_type_start(after)
+    }
+
+    fn parse_object_name(&self, s: String) -> CDType {
+        if let Some(open) = s.find('<') {
+            if let Some(close) = s.rfind('>') {
+                if close > open {
+                    let protocols: Vec<String> =
+                        s[open + 1..close].split(',').map(|x| x.to_string()).collect();
+                    let name = s[..open].trim().to_string();
+                    if !name.is_empty() && name != "id" {
+                        return CDType {
+                            prim: T_NAMED_OBJECT,
+                            type_name: Some(name),
+                            protocols,
+                            ..Default::default()
+                        };
+                    }
+                    return CDType { prim: b'@', protocols, ..Default::default() };
+                }
+            }
+        }
+        CDType { prim: T_NAMED_OBJECT, type_name: Some(s), ..Default::default() }
+    }
+
+    /// Parse a (possibly templated) type name, mirroring CDTypeParser.parseTypeName.
+    /// `in_template` selects the lexer behaviour: identifier scan at top level,
+    /// "anything but <,>" runs inside template arguments.
+    fn parse_type_name(&mut self, in_template: bool) -> Option<String> {
+        let base = if in_template {
+            self.scan_template_run()
+        } else {
+            self.scan_identifier()
+        };
+        let base = match base {
+            Some(b) => b,
+            None => return None,
+        };
+        if self.peek() != Some(b'<') {
+            return Some(base);
+        }
+        // template arguments
+        self.pos += 1; // '<'
+        let mut args: Vec<String> = Vec::new();
+        args.push(self.parse_type_name(true).unwrap_or_default());
+        while self.peek() == Some(b',') {
+            self.pos += 1;
+            args.push(self.parse_type_name(true).unwrap_or_default());
+        }
+        if self.peek() == Some(b'>') {
+            self.pos += 1;
+        }
+        let suffix = if in_template {
+            self.scan_template_run().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some(format!("{}<{}>{}", base, args.join(", "), suffix))
+    }
+
+    fn scan_identifier(&mut self) -> Option<String> {
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+            return Some("?".to_string());
+        }
+        match self.peek() {
+            Some(c) if is_identifier_start(c) => {}
+            _ => return None,
+        }
         let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch == b'=' || ch == close {
+        while let Some(c) = self.peek() {
+            if is_identifier_char(c) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned())
+    }
+
+    fn scan_template_run(&mut self) -> Option<String> {
+        // skip leading whitespace (lexer skips whitespace in TemplateTypes state)
+        while self.peek() == Some(b' ') {
+            self.pos += 1;
+        }
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == b'<' || c == b'>' || c == b',' {
                 break;
             }
             self.pos += 1;
         }
-        let name = String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned();
-        let mut fields = Vec::new();
+        if self.pos == start {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned())
+        }
+    }
+
+    fn parse_optional_members(&mut self, close: u8) -> Vec<CDType> {
+        let mut members = Vec::new();
         if self.peek() == Some(b'=') {
             self.pos += 1;
-            while let Some(ch) = self.peek() {
-                if ch == close {
+            while let Some(c) = self.peek() {
+                if c == close {
                     break;
                 }
-                // optional field name in quotes
-                let mut field_name = None;
-                if ch == b'"' {
-                    self.pos += 1;
-                    let s = self.pos;
-                    while let Some(c2) = self.peek() {
-                        if c2 == b'"' {
-                            break;
-                        }
-                        self.pos += 1;
-                    }
-                    field_name =
-                        Some(String::from_utf8_lossy(&self.bytes[s..self.pos]).into_owned());
-                    if self.peek() == Some(b'"') {
-                        self.pos += 1;
-                    }
+                let mut var_name = None;
+                if c == b'"' {
+                    var_name = Some(self.read_quoted());
                     if self.peek() == Some(close) {
-                        fields.push((field_name, Type::Unknown));
                         break;
                     }
                 }
-                let ty = self.parse_type();
-                fields.push((field_name, ty));
+                let mut ty = self.parse_type_in_struct(true);
+                ty.variable_name = var_name;
+                members.push(ty);
             }
         }
-        if self.peek() == Some(close) {
-            self.pos += 1;
+        members
+    }
+
+    /// Parse a sequence of (type, number) pairs until `end` or end-of-input; return the types.
+    fn parse_method_type_list(&mut self, end: u8) -> Vec<CDType> {
+        let mut out = Vec::new();
+        while let Some(c) = self.peek() {
+            if c == end {
+                break;
+            }
+            let ty = self.parse_type();
+            // skip offset number
+            let _ = self.read_number();
+            out.push(ty);
         }
-        if open == b'{' {
-            Type::Struct(name, fields)
-        } else {
-            Type::Union(name, fields)
-        }
+        out
     }
 }
 
-/// Parse the full method type string into a vector of types (return + self + _cmd + args),
-/// skipping the frame-offset digits between them.
-pub fn parse_method_types(s: &str) -> Vec<Type> {
+/// Parse a full method type string into (type, _offset) types: [return, self, _cmd, args...].
+pub fn parse_method_types(s: &str) -> Vec<CDType> {
     let mut p = Parser::new(s);
     let mut out = Vec::new();
-    while p.peek().is_some() {
-        // A leading digit with no type would be malformed; guard.
+    while !p.at_end() {
         if p.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-            p.skip_digits();
+            p.read_number();
             continue;
         }
         let ty = p.parse_type();
-        p.skip_digits();
+        p.read_number();
         out.push(ty);
     }
     out
-}
-
-fn primitive_name(c: char) -> &'static str {
-    match c {
-        'c' => "char",
-        'i' => "int",
-        's' => "short",
-        'l' => "long",
-        'q' => "long long",
-        'C' => "unsigned char",
-        'I' => "unsigned int",
-        'S' => "unsigned short",
-        'L' => "unsigned long",
-        'Q' => "unsigned long long",
-        'f' => "float",
-        'd' => "double",
-        'D' => "long double",
-        'B' => "_Bool",
-        'v' => "void",
-        _ => "void",
-    }
-}
-
-/// Format `ty` as a C declaration embedding `name` (which may be empty).
-pub fn format(ty: &Type, name: &str) -> String {
-    match ty {
-        Type::Modifier(_, inner) => format(inner, name),
-        Type::Primitive(c) => join(primitive_name(*c), name),
-        Type::Id => join("id", name),
-        Type::Class => join("Class", name),
-        Type::Sel => join("SEL", name),
-        Type::Block => join("CDUnknownBlockType", name),
-        Type::Unknown => join("void", name), // bare '?' rarely standalone
-        Type::FunctionPointer => join("CDUnknownFunctionPointerType", name),
-        Type::NamedObject(cls) => {
-            if cls.starts_with('<') {
-                // protocol-only object: id <Proto>
-                if name.is_empty() {
-                    format!("id {}", cls)
-                } else {
-                    format!("id {} {}", cls, name)
-                }
-            } else if name.is_empty() {
-                format!("{} *", cls)
-            } else {
-                format!("{} *{}", cls, name)
-            }
-        }
-        Type::CharStar => {
-            if name.is_empty() {
-                "char *".to_string()
-            } else {
-                format!("char *{}", name)
-            }
-        }
-        Type::Pointer(inner) => {
-            // pointer: attach '*' to the name
-            let inner_name = format!("*{}", name);
-            format(inner, &inner_name)
-        }
-        Type::Array(count, inner) => {
-            let arr_name = format!("{}[{}]", name, count);
-            format(inner, &arr_name)
-        }
-        Type::Bitfield(n) => {
-            if name.is_empty() {
-                format!("unsigned int :{}", n)
-            } else {
-                format!("unsigned int {}:{}", name, n)
-            }
-        }
-        Type::Struct(sname, fields) => format_record("struct", sname, fields, name),
-        Type::Union(sname, fields) => format_record("union", sname, fields, name),
-    }
-}
-
-fn format_record(
-    kw: &str,
-    sname: &str,
-    fields: &[(Option<String>, Type)],
-    name: &str,
-) -> String {
-    // Anonymous (name is "?" or empty) -> expand inline; named -> "struct Name".
-    let anonymous = sname.is_empty() || sname == "?";
-    let head = if anonymous {
-        if fields.is_empty() {
-            format!("{} {{ }}", kw)
-        } else {
-            let mut s = format!("{} {{\n", kw);
-            for (i, (fname, fty)) in fields.iter().enumerate() {
-                let fn_name = fname.clone().unwrap_or_else(|| format!("_field{}", i + 1));
-                s.push_str("    ");
-                s.push_str(&format(fty, &fn_name));
-                s.push_str(";\n");
-            }
-            s.push('}');
-            s
-        }
-    } else {
-        format!("{} {}", kw, sname)
-    };
-    join(&head, name)
-}
-
-fn join(base: &str, name: &str) -> String {
-    if name.is_empty() {
-        base.to_string()
-    } else {
-        format!("{} {}", base, name)
-    }
-}
-
-/// Format a full method declaration: `- (ret)sel:(a)arg1 ...` (prefix is "-" or "+").
-pub fn format_method(prefix: char, selector: &str, type_string: &str) -> String {
-    let types = parse_method_types(type_string);
-    let ret = types.get(0).cloned().unwrap_or(Type::Id);
-    let ret_str = format(&ret, "");
-    // args after self(@) and _cmd(:)
-    let args: Vec<&Type> = types.iter().skip(3).collect();
-
-    let parts: Vec<&str> = selector.split(':').collect();
-    // A selector with no colon: split yields [selector]; no args.
-    if selector.contains(':') {
-        // parts has trailing "" because selector ends with ':'
-        let keywords: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).cloned().collect();
-        let n = keywords.len();
-        let mut s = format!("{} ({}){}", prefix, ret_str.trim(), "");
-        // Build "kw:(type)argN " for each keyword.
-        let mut decl = String::new();
-        for i in 0..n {
-            let argty = args.get(i).cloned().cloned().unwrap_or(Type::Id);
-            let aname = format!("arg{}", i + 1);
-            // selector keyword includes the colon
-            decl.push_str(&format!("{}:({}){}", keywords[i], format(&argty, "").trim(), aname));
-            if i + 1 < n {
-                decl.push(' ');
-            }
-        }
-        s = format!("{} ({}){}", prefix, ret_str.trim(), decl);
-        s
-    } else {
-        format!("{} ({}){}", prefix, ret_str.trim(), selector)
-    }
 }
