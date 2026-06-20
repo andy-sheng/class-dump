@@ -165,10 +165,10 @@ fn format_property(tc: &TypeController, p: &Property) -> String {
 
 // ----- method formatting (port of formatMethodName) -----
 
-fn format_method(tc: &TypeController, selector: &str, type_string: &str) -> String {
-    let types = typ::parse_method_types(type_string);
+fn format_method(tc: &TypeController, selector: &str, type_string: &str) -> Option<String> {
+    let types = typ::parse_method_types(type_string)?;
     if types.is_empty() {
-        return format!("({})", selector);
+        return Some(format!("({})", selector));
     }
     let cfg = plain_cfg();
     let ret = tc.format_type_no_merge(&types[0], &cfg);
@@ -204,7 +204,25 @@ fn format_method(tc: &TypeController, selector: &str, type_string: &str) -> Stri
     if no_more {
         result.push_str(" /* Error: Ran out of types for this method. */");
     }
-    result
+    Some(result)
+}
+
+/// Emit one method line with the given prefix ('+' or '-'), or the parse-error comment.
+fn emit_method(tc: &TypeController, out: &mut String, prefix: char, m: &Method) {
+    out.push(prefix);
+    out.push(' ');
+    match format_method(tc, &m.name, &m.type_string) {
+        Some(body) => {
+            out.push_str(&body);
+            out.push_str(";\n");
+        }
+        None => {
+            out.push_str(&format!(
+                "    // Error parsing type: {}, name: {}\n",
+                m.type_string, m.name
+            ));
+        }
+    }
 }
 
 // ----- property state (uniqued by name) -----
@@ -266,16 +284,12 @@ fn visit_methods(
                 out.push_str(&format_property(tc, &p));
             }
         } else {
-            out.push_str("- ");
-            out.push_str(&format_method(tc, &m.name, &m.type_string));
-            out.push_str(";\n");
+            emit_method(tc, out, '-', m);
         }
     };
 
     for m in sorted(class_methods) {
-        out.push_str("+ ");
-        out.push_str(&format_method(tc, &m.name, &m.type_string));
-        out.push_str(";\n");
+        emit_method(tc, out, '+', &m);
     }
     for m in sorted(instance_methods) {
         emit_instance(out, &mut state, &m);
@@ -283,9 +297,7 @@ fn visit_methods(
     if !optional_class.is_empty() || !optional_instance.is_empty() {
         out.push_str("\n@optional\n");
         for m in sorted(optional_class) {
-            out.push_str("+ ");
-            out.push_str(&format_method(tc, &m.name, &m.type_string));
-            out.push_str(";\n");
+            emit_method(tc, out, '+', &m);
         }
         for m in sorted(optional_instance) {
             emit_instance(out, &mut state, &m);
@@ -367,8 +379,10 @@ fn visit_category(tc: &TypeController, out: &mut String, c: &Category, opts: &Op
 
 fn register_methods(tc: &mut TypeController, methods: &[Method]) {
     for m in methods {
-        for t in typ::parse_method_types(&m.type_string) {
-            tc.register_type(&t, true);
+        if let Some(types) = typ::parse_method_types(&m.type_string) {
+            for t in types {
+                tc.register_type(&t, true);
+            }
         }
     }
 }

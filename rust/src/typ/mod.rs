@@ -554,11 +554,22 @@ fn simple_type_name(prim: u8) -> &'static str {
 pub struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Set when a required token did not match (mirrors CDTypeParser's thrown syntax error).
+    pub failed: bool,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(s: &'a str) -> Self {
-        Parser { bytes: s.as_bytes(), pos: 0 }
+        Parser { bytes: s.as_bytes(), pos: 0, failed: false }
+    }
+
+    /// Consume `c` if present, otherwise flag a parse failure (like CDTypeParser.match:).
+    fn expect(&mut self, c: u8) {
+        if self.peek() == Some(c) {
+            self.pos += 1;
+        } else {
+            self.failed = true;
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -675,9 +686,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let name = self.parse_type_name(false);
                 let members = self.parse_optional_members(b'}');
-                if self.peek() == Some(b'}') {
-                    self.pos += 1;
-                }
+                self.expect(b'}');
                 CDType { prim: b'{', type_name: name, members, ..Default::default() }
             }
             b'(' => {
@@ -690,9 +699,7 @@ impl<'a> Parser<'a> {
                 if starts_name {
                     let name = self.parse_type_name(false);
                     let members = self.parse_optional_members(b')');
-                    if self.peek() == Some(b')') {
-                        self.pos += 1;
-                    }
+                    self.expect(b')');
                     CDType { prim: b'(', type_name: name, members, ..Default::default() }
                 } else {
                     let mut members = Vec::new();
@@ -700,11 +707,14 @@ impl<'a> Parser<'a> {
                         if c == b')' {
                             break;
                         }
+                        let before = self.pos;
                         members.push(self.parse_type_in_struct(true));
+                        if self.pos == before {
+                            self.failed = true;
+                            break;
+                        }
                     }
-                    if self.peek() == Some(b')') {
-                        self.pos += 1;
-                    }
+                    self.expect(b')');
                     CDType { prim: b'(', type_name: None, members, ..Default::default() }
                 }
             }
@@ -712,9 +722,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let n = self.read_number();
                 let sub = self.parse_type();
-                if self.peek() == Some(b']') {
-                    self.pos += 1;
-                }
+                self.expect(b']');
                 CDType { prim: b'[', array_size: n, subtype: Some(Box::new(sub)), ..Default::default() }
             }
             b'*' => {
@@ -727,8 +735,8 @@ impl<'a> Parser<'a> {
                 CDType::simple(c)
             }
             _ => {
-                // Unrecognized token: class-dump produces a named object "MISSING_TYPE".
-                self.pos += 1;
+                // Unrecognized token: class-dump produces a named object "MISSING_TYPE" and does
+                // NOT consume the token, so an enclosing required match later fails.
                 missing_type()
             }
         }
@@ -859,9 +867,15 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
+                let before = self.pos;
                 let mut ty = self.parse_type_in_struct(true);
                 ty.variable_name = var_name;
                 members.push(ty);
+                if self.pos == before {
+                    // No progress (unrecognized token): would have thrown in class-dump.
+                    self.failed = true;
+                    break;
+                }
             }
         }
         members
@@ -874,27 +888,42 @@ impl<'a> Parser<'a> {
             if c == end {
                 break;
             }
+            let before = self.pos;
             let ty = self.parse_type();
-            // skip offset number
             let _ = self.read_number();
             out.push(ty);
+            if self.pos == before {
+                break;
+            }
         }
         out
     }
 }
 
 /// Parse a full method type string into (type, _offset) types: [return, self, _cmd, args...].
-pub fn parse_method_types(s: &str) -> Vec<CDType> {
+/// Returns None if the type could not be parsed (matches class-dump's thrown syntax error).
+pub fn parse_method_types(s: &str) -> Option<Vec<CDType>> {
     let mut p = Parser::new(s);
     let mut out = Vec::new();
-    while !p.at_end() {
-        if p.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-            p.read_number();
-            continue;
-        }
+    if p.at_end() {
+        return Some(out);
+    }
+    // do-while: parse one type, then continue while the next token starts a type.
+    loop {
         let ty = p.parse_type();
         p.read_number();
         out.push(ty);
+        if p.failed {
+            return None;
+        }
+        match p.peek() {
+            Some(c) if p.is_type_start(c) || c == b'"' => {}
+            _ => break,
+        }
     }
-    out
+    if p.failed {
+        None
+    } else {
+        Some(out)
+    }
 }

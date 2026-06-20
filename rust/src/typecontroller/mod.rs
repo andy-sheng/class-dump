@@ -564,6 +564,28 @@ impl TypeController {
                 out.push_str(";\n\n");
             }
         }
+
+        // Name exceptions (conflicting types), inside an #if 0 block.
+        let mut shown_exc = false;
+        let mut excs: Vec<Info> = table.phase3_name_exceptions.values().cloned().collect();
+        depth_sort(&mut excs);
+        for info in &excs {
+            if !table.should_expand_info(Some(info)) {
+                if !added_mark {
+                    out.push_str(&format!("#pragma mark {}\n\n", mark));
+                    added_mark = true;
+                }
+                if !shown_exc {
+                    out.push_str("#if 0\n// Names with conflicting types:\n");
+                    shown_exc = true;
+                }
+                let s = self.format_variable(None, &info.ty, &cfg);
+                out.push_str(&format!("typedef {} {};\n\n", s, info.typedef_name.clone().unwrap_or_default()));
+            }
+        }
+        if shown_exc {
+            out.push_str("#endif\n\n");
+        }
     }
 
     fn append_typedefs(&self, out: &mut String, table: &Table, mark: &str) {
@@ -576,6 +598,25 @@ impl TypeController {
                 if !added_mark {
                     out.push_str(&format!("#pragma mark {}\n\n", mark));
                     added_mark = true;
+                }
+                let s = self.format_variable(None, &info.ty, &cfg);
+                out.push_str(&format!("typedef {} {};\n\n", s, info.typedef_name.clone().unwrap_or_default()));
+            }
+        }
+
+        // Anonymous exceptions ("Ambiguous groups").
+        let mut shown_exc = false;
+        let mut excs: Vec<Info> = table.phase3_anon_exceptions.values().cloned().collect();
+        depth_sort(&mut excs);
+        for info in &excs {
+            if !table.should_expand_info(Some(info)) {
+                if !added_mark {
+                    out.push_str(&format!("#pragma mark {}\n\n", mark));
+                    added_mark = true;
+                }
+                if !shown_exc {
+                    out.push_str("// Ambiguous groups\n");
+                    shown_exc = true;
                 }
                 let s = self.format_variable(None, &info.ty, &cfg);
                 out.push_str(&format!("typedef {} {};\n\n", s, info.typedef_name.clone().unwrap_or_default()));

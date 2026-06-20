@@ -289,7 +289,7 @@ impl<'a> Processor<'a> {
             for index in 0..count as u64 {
                 let name_field_address = address + 8 + index * 12;
                 let types_field_address = name_field_address + 4;
-                let imp_field_address = name_field_address + 8;
+                let _imp_field_address = name_field_address + 8;
                 let name_offset = cur.read_u32() as i32;
                 let types_offset = cur.read_u32() as i32;
                 let _imp_offset = cur.read_u32() as i32;
