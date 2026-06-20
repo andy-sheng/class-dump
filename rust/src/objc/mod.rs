@@ -111,6 +111,12 @@ impl<'a> Processor<'a> {
         ObjcImage { classes, categories, protocols }
     }
 
+    /// Look up a class/category protocol address in the uniquer. Returns the protocol name only
+    /// if that exact address was registered while loading __objc_protolist (+ adopted protocols).
+    fn uniqued_protocol_name(&self, address: u64) -> Option<String> {
+        self.protocols_by_address.get(&address).map(|p| p.name.clone())
+    }
+
     fn load_protocols(&mut self) {
         let sect = match self.section_by_name("__objc_protolist") {
             Some(s) => s.clone(),
@@ -170,9 +176,12 @@ impl<'a> Processor<'a> {
         class.ivars = self.load_ivars(ro.ivars);
         class.properties = self.load_properties(ro.base_properties);
         for paddr in self.protocol_address_list(ro.base_protocols) {
-            let p = self.protocol_at(paddr);
-            if let Some(name) = p {
-                class.protocols.push(name);
+            // Class protocols are looked up in the uniquer (populated from __objc_protolist
+            // + adopted protocols), never created; unknown addresses are skipped.
+            if let Some(name) = self.uniqued_protocol_name(paddr) {
+                if !class.protocols.contains(&name) {
+                    class.protocols.push(name);
+                }
             }
         }
         // class methods live on the metaclass (isa).
@@ -412,7 +421,9 @@ impl<'a> Processor<'a> {
         let mut adopted = Vec::new();
         for paddr in self.protocol_address_list(protocols) {
             if let Some(n) = self.protocol_at(paddr) {
-                adopted.push(n);
+                if !adopted.contains(&n) {
+                    adopted.push(n);
+                }
             }
         }
 
@@ -469,8 +480,10 @@ impl<'a> Processor<'a> {
         category.instance_methods = self.load_methods(instance_methods, &mut None);
         category.class_methods = self.load_methods(class_methods, &mut None);
         for paddr in self.protocol_address_list(protocols) {
-            if let Some(n) = self.protocol_at(paddr) {
-                category.protocols.push(n);
+            if let Some(n) = self.uniqued_protocol_name(paddr) {
+                if !category.protocols.contains(&n) {
+                    category.protocols.push(n);
+                }
             }
         }
         category.properties = self.load_properties(instance_properties);
