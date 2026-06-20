@@ -294,9 +294,9 @@ pub fn format(ty: &Type, name: &str) -> String {
         }
         Type::Bitfield(n) => {
             if name.is_empty() {
-                format!("int : {}", n)
+                format!("unsigned int :{}", n)
             } else {
-                format!("int {} : {}", name, n)
+                format!("unsigned int {}:{}", name, n)
             }
         }
         Type::Struct(sname, fields) => format_record("struct", sname, fields, name),

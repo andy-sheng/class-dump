@@ -28,6 +28,21 @@ Validated against the original class-dump 3.5.1 on real apps (Grace, WeChat):
 
 - Struct/union **typedef table** (`CDStruct_<hash>` naming + the "Named/Typedef'd
   Structures/Unions" sections); currently anonymous structs are expanded inline.
+  Algorithm reverse-engineered and confirmed against the original:
+  - Typedef name = `"CDStruct_" + last 8 hex chars of SHA1(typeString)`, where
+    `typeString` is the canonical encoding *including* member names, e.g.
+    `SHA1('{?="value"q"timescale"i"flags"I"epoch"q}')` ends in `1b6d18a9`
+    → `CDStruct_1b6d18a9` (verified).
+  - Anonymous structs are merged by `reallyBareTypeString` (member names and
+    object type names stripped) so occurrences with/without member names share
+    one typedef; the representative (richest member info) defines the layout.
+  - 4-phase pipeline (CDTypeController/CDStructureTable): phase0 register,
+    phase1 recurse + group by structure depth, phase2 depth-ordered merge +
+    nested replacement, phase3 expand-vs-reference decision + member-name
+    generation. Inline contexts reference by name; the declaration formatter
+    expands at the definition site.
+  This needs a faithful CDType AST (member names, type names, the three
+  `typeString` variants, `structureDepth`, `mergeWithType`).
 - Block signature decoding (`void (^)(_Bool)`).
 - Header + per-file comment block (UUID, versions, GC line).
 - CLI options: `-H`/`-o`, `--arch`, `-s`/`-S` sorting, fat binaries, ObjC1 (32-bit).
