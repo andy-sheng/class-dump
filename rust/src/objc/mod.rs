@@ -101,14 +101,26 @@ impl<'a> Processor<'a> {
         self.load_protocols();
         let classes = self.load_classes();
         let categories = self.load_categories();
-        // Collect protocols in discovery order.
-        let mut protocols: Vec<Protocol> = Vec::new();
-        for addr in &self.protocol_order {
-            if let Some(p) = self.protocols_by_address.get(addr) {
-                protocols.push(p.clone());
-            }
-        }
+        let protocols = self.create_uniqued_protocols();
         ObjcImage { classes, categories, protocols }
+    }
+
+    /// Build the unique-by-name protocols, merging methods/properties from every same-named
+    /// copy (address-ascending), mirroring CDProtocolUniquer.createUniquedProtocols.
+    fn create_uniqued_protocols(&self) -> Vec<Protocol> {
+        let mut addrs: Vec<u64> = self.protocols_by_address.keys().copied().collect();
+        addrs.sort();
+        let mut uniq: HashMap<String, Protocol> = HashMap::new();
+        for addr in addrs {
+            let p1 = &self.protocols_by_address[&addr];
+            let u = uniq
+                .entry(p1.name.clone())
+                .or_insert_with(|| Protocol { name: p1.name.clone(), ..Default::default() });
+            merge_protocol_into(u, p1);
+        }
+        let mut v: Vec<Protocol> = uniq.into_values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 
     /// Look up a class/category protocol address in the uniquer. Returns the protocol name only
@@ -499,6 +511,70 @@ impl<'a> Processor<'a> {
         }
 
         Some(category)
+    }
+}
+
+/// Merge `p1`'s adopted protocols, methods and properties into `u`, deduping by name
+/// (mirrors CDOCProtocol.mergeMethodsFromProtocol / mergePropertiesFromProtocol).
+fn merge_protocol_into(u: &mut Protocol, p1: &Protocol) {
+    use std::collections::HashSet;
+    for n in &p1.adopted_protocols {
+        if !u.adopted_protocols.contains(n) {
+            u.adopted_protocols.push(n.clone());
+        }
+    }
+    let names = |ms: &[Method]| -> HashSet<String> { ms.iter().map(|m| m.name.clone()).collect() };
+
+    let mut inst = names(&u.instance_methods);
+    let mut opt_inst = names(&u.optional_instance_methods);
+    for m in &p1.instance_methods {
+        if !inst.contains(&m.name) && !opt_inst.contains(&m.name) {
+            u.instance_methods.push(m.clone());
+            inst.insert(m.name.clone());
+        }
+    }
+    for m in &p1.optional_instance_methods {
+        if !opt_inst.contains(&m.name) {
+            if !inst.contains(&m.name) {
+                u.optional_instance_methods.push(m.clone());
+                opt_inst.insert(m.name.clone());
+            } else if let Some(pos) = u.instance_methods.iter().position(|x| x.name == m.name) {
+                let m2 = u.instance_methods.remove(pos);
+                inst.remove(&m2.name);
+                opt_inst.insert(m2.name.clone());
+                u.optional_instance_methods.push(m2);
+            }
+        }
+    }
+
+    let mut cls = names(&u.class_methods);
+    let mut opt_cls = names(&u.optional_class_methods);
+    for m in &p1.class_methods {
+        if !cls.contains(&m.name) && !opt_cls.contains(&m.name) {
+            u.class_methods.push(m.clone());
+            cls.insert(m.name.clone());
+        }
+    }
+    for m in &p1.optional_class_methods {
+        if !opt_cls.contains(&m.name) {
+            if !cls.contains(&m.name) {
+                u.optional_class_methods.push(m.clone());
+                opt_cls.insert(m.name.clone());
+            } else if let Some(pos) = u.class_methods.iter().position(|x| x.name == m.name) {
+                let m2 = u.class_methods.remove(pos);
+                cls.remove(&m2.name);
+                opt_cls.insert(m2.name.clone());
+                u.optional_class_methods.push(m2);
+            }
+        }
+    }
+
+    let mut props: HashSet<String> = u.properties.iter().map(|p| p.name.clone()).collect();
+    for p in &p1.properties {
+        if !props.contains(&p.name) {
+            u.properties.push(p.clone());
+            props.insert(p.name.clone());
+        }
     }
 }
 
