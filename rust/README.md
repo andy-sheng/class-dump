@@ -7,45 +7,41 @@ Unlike the original (which links Foundation and the Objective-C runtime and only
 builds on macOS), this port has no platform dependencies — it just parses Mach-O
 bytes — so it builds and runs on macOS, Linux and Windows.
 
-## Status
+## Fidelity
 
-Validated against the original class-dump 3.5.1 on real apps (Grace, WeChat):
+Validated against the original class-dump 3.5.1 on real apps:
 
-- **Mach-O container**: header, load commands, segments/sections, symbol table,
-  fat detection — done.
-- **Pointer resolution**: classic `LC_DYLD_INFO` binds + `LC_DYLD_CHAINED_FIXUPS`
-  (rebases patched in place, binds recorded) — done.
-- **ObjC2 metadata**: classes, categories, protocols (incl. `__objc_protolist`),
-  methods (incl. relative/small method lists and shared extended method types),
-  ivars, properties — done. Class/protocol counts match exactly
-  (WeChat: 39958 classes, 6913 protocols).
-- **Output**: `@interface`/`@protocol`/`@interface(Category)` bodies, property
-  synthesis/accessor folding, `@optional`, "Remaining properties",
-  hidden-visibility attribute — common cases are byte-for-byte identical
-  (e.g. `MMUIViewController` matches exactly).
+- **WeChat.app** (arm64, chained fixups, ~1.26M lines of output): every one of
+  46,866 `@interface`/`@protocol` blocks is byte-for-byte identical; the entire
+  dump matches except 2 lines.
+- **Grace.app** (arm64, LC_DYLD_INFO): 15,467 / 15,472 blocks identical.
 
-## Remaining work (well-scoped)
+The handful of residual differences are all caused by the *original* tool's
+hash-order-dependent structure merging (the canonical member names / kept
+protocol qualifier for a structure shared by multiple definitions depend on
+`NSDictionary` enumeration order, which is not reproducible). This port instead
+produces deterministic output.
 
-- Struct/union **typedef table** (`CDStruct_<hash>` naming + the "Named/Typedef'd
-  Structures/Unions" sections); currently anonymous structs are expanded inline.
-  Algorithm reverse-engineered and confirmed against the original:
-  - Typedef name = `"CDStruct_" + last 8 hex chars of SHA1(typeString)`, where
-    `typeString` is the canonical encoding *including* member names, e.g.
-    `SHA1('{?="value"q"timescale"i"flags"I"epoch"q}')` ends in `1b6d18a9`
-    → `CDStruct_1b6d18a9` (verified).
-  - Anonymous structs are merged by `reallyBareTypeString` (member names and
-    object type names stripped) so occurrences with/without member names share
-    one typedef; the representative (richest member info) defines the layout.
-  - 4-phase pipeline (CDTypeController/CDStructureTable): phase0 register,
-    phase1 recurse + group by structure depth, phase2 depth-ordered merge +
-    nested replacement, phase3 expand-vs-reference decision + member-name
-    generation. Inline contexts reference by name; the declaration formatter
-    expands at the definition site.
-  This needs a faithful CDType AST (member names, type names, the three
-  `typeString` variants, `structureDepth`, `mergeWithType`).
-- Block signature decoding (`void (^)(_Bool)`).
-- Header + per-file comment block (UUID, versions, GC line).
-- CLI options: `-H`/`-o`, `--arch`, `-s`/`-S` sorting, fat binaries, ObjC1 (32-bit).
+## What's implemented
+
+- Mach-O container: header, load commands, segments/sections, symbol table.
+- Pointer resolution: `LC_DYLD_INFO` bind opcodes + `LC_DYLD_CHAINED_FIXUPS`.
+- ObjC2 metadata: classes, categories, protocols (`__objc_protolist` + uniquing
+  with method/property merge), methods (incl. relative method lists and shared
+  extended method types), ivars, properties.
+- Full CDType type system: parser/lexer (incl. C++ template tag names, blocks
+  with signatures, char→BOOL, MISSING_TYPE, parse-failure replication), the
+  4-phase CDTypeController/CDStructureTable structure pipeline with
+  CDStruct_/CDUnion_ typedef naming (SHA1-based), expand-vs-reference decisions,
+  and the named/typedef/exception structure sections.
+- Output: header + per-file comment block (UUID, versions, GC, run paths),
+  declarations with property/accessor folding, and the structure sections.
+
+## Not yet implemented
+
+- Fat (universal) binaries and 32-bit / ObjC1 (`__OBJC`) images.
+- CLI options: `-H`/`-o` (headers to files), `--arch`, `-s`/`-S` sorting, etc.
+  (Currently dumps a single thin image to stdout, like `class-dump <file>`.)
 
 ## Build & run
 

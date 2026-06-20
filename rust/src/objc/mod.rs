@@ -68,11 +68,17 @@ pub struct Processor<'a> {
     macho: &'a MachOFile,
     protocols_by_address: HashMap<u64, Protocol>,
     protocol_order: Vec<u64>,
+    classes_by_address: HashMap<u64, String>,
 }
 
 impl<'a> Processor<'a> {
     pub fn new(macho: &'a MachOFile) -> Self {
-        Processor { macho, protocols_by_address: HashMap::new(), protocol_order: Vec::new() }
+        Processor {
+            macho,
+            protocols_by_address: HashMap::new(),
+            protocol_order: Vec::new(),
+            classes_by_address: HashMap::new(),
+        }
     }
 
     fn cursor_at(&self, address: u64) -> Option<Cursor<'a>> {
@@ -158,6 +164,8 @@ impl<'a> Processor<'a> {
             if let Some(mut cur) = self.cursor_at(addr) {
                 let class_ptr = cur.read_ptr();
                 if let Some(c) = self.load_class_at(class_ptr) {
+                    // Record by classlist address for category classWithAddress: lookups.
+                    self.classes_by_address.insert(class_ptr, c.name.clone());
                     classes.push(c);
                 }
             }
@@ -506,8 +514,14 @@ impl<'a> Processor<'a> {
                 .macho
                 .external_class_name_for_address(class_name_address)
                 .unwrap_or_default();
-        } else if class_ptr != 0 {
-            category.class_name = self.read_superclass_name(class_ptr).unwrap_or_default();
+        } else {
+            // Internal class: classWithAddress: lookup. Classes not loaded from __objc_classlist
+            // resolve to nil, which class-dump prints as "(null)".
+            category.class_name = self
+                .classes_by_address
+                .get(&class_ptr)
+                .cloned()
+                .unwrap_or_else(|| "(null)".to_string());
         }
 
         Some(category)

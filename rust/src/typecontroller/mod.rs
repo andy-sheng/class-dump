@@ -387,7 +387,8 @@ impl TypeController {
             }
         }
         let table = if is_union { &mut self.unions } else { &mut self.structs };
-        for (key, group) in name_dict {
+        for (key, mut group) in name_dict {
+            group.sort_by(|a, b| a.ty.type_string().cmp(&b.ty.type_string()));
             match combine(&group) {
                 Some(c) => {
                     if table.phase2_named.contains_key(&key) {
@@ -402,7 +403,8 @@ impl TypeController {
                 None => table.phase2_name_exceptions.extend(group),
             }
         }
-        for (key, group) in anon_dict {
+        for (key, mut group) in anon_dict {
+            group.sort_by(|a, b| a.ty.type_string().cmp(&b.ty.type_string()));
             match combine(&group) {
                 Some(c) => {
                     table.phase2_anon.insert(key, c);
