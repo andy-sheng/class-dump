@@ -174,6 +174,13 @@
         [protocol registerTypesWithObject:typeController phase:phase];
 }
 
+// 已解析出的类 + 分类数量（recursivelyVisit 恰好会遍历这么多个），供调用方
+// 无需额外遍历即可得到进度总数。
+- (NSUInteger)classAndCategoryCount;
+{
+    return _classes.count + _categories.count;
+}
+
 - (void)recursivelyVisit:(CDVisitor *)visitor;
 {
     NSMutableArray *classesAndCategories = [[NSMutableArray alloc] init];

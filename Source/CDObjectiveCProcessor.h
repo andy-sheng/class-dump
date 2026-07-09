@@ -32,6 +32,7 @@
 - (void)loadCategories;
 
 - (void)registerTypesWithObject:(CDTypeController *)typeController phase:(NSUInteger)phase;
+- (NSUInteger)classAndCategoryCount;
 - (void)recursivelyVisit:(CDVisitor *)visitor;
 
 - (NSArray *)protocolAddressListAtAddress:(uint64_t)address;
